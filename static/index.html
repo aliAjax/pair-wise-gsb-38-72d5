@@ -1,17 +1,32 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>字幕本地化质检</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px}input,select,textarea,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre,textarea{background:#f5f7f9;padding:12px;overflow:auto;width:100%;box-sizing:border-box}button{cursor:pointer}small{color:#667}</style></head>
-<body><h1>影视字幕本地化质检</h1><p>示例项目已含术语表。分配翻译、时间轴和复核人员后，录入带时间点的字幕与评论，再完成提交、复核、锁定和交付。</p>
+<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px}input,select,textarea,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre,textarea{background:#f5f7f9;padding:12px;overflow:auto;width:100%;box-sizing:border-box}button{cursor:pointer}small{color:#667}ul{list-style:none;padding-left:0}li{padding:6px 10px;margin:4px 0;border-radius:6px}.add li{background:#e7f6e7;border-left:4px solid #2e9e44}.mod li{background:#fff6e0;border-left:4px solid #d9930d}.del li{background:#fdeaea;border-left:4px solid #d33;text-decoration:line-through}.mod small{text-decoration:none}</style></head>
+<body><h1>影视字幕本地化质检</h1><p>示例项目已含术语表。分配翻译、时间轴和复核人员后，录入带时间点的字幕与评论，再完成提交、复核、锁定和交付。返修时基于同项目同语言的父版本创建新版本，差异会保留到复核通过。</p>
 <div class="card"><h2>身份与版本</h2><input id="user" value="alice"><select id="role"><option>owner</option><option>reviewer</option><option>translator</option><option>admin</option></select><label>版本 ID <input id="version" type="number" value="1"></label><button onclick="refresh()">刷新</button><pre id="data">等待刷新…</pre></div>
-<div class="card"><h2>录入字幕</h2><textarea id="cue" rows="5">{"cue_index":1,"start_ms":1000,"end_ms":3000,"text":"海豹出现在冰面上","expected_revision":0}</textarea><button onclick="saveCue()">保存字幕</button><pre id="cueResult"></pre></div>
+<div class="card"><h2>新建返修版本</h2><label>项目 ID <input id="projId" type="number" value="1"></label><label>语言 <input id="lang" value="zh-CN" size="8"></label><label>父版本 ID <input id="parentId" type="number" placeholder="留空新建空版本"></label><input id="reason" placeholder="返修原因（选择父版本时必填）" size="32"><button onclick="createVersion()">创建版本</button><pre id="versionResult"></pre></div>
+<div class="card"><h2>返修差异（相对父版本基线）</h2><div id="diff">刷新后展示当前版本相对父版本新增、改写和移除的句子。</div></div>
+<div class="card"><h2>录入字幕</h2><textarea id="cue" rows="5">{"cue_index":1,"start_ms":1000,"end_ms":3000,"text":"海豹出现在冰面上","expected_revision":0}</textarea><button onclick="saveCue()">保存字幕</button><label>删除字幕 ID <input id="delCue" type="number"></label><button onclick="removeCue()">删除字幕</button><pre id="cueResult"></pre></div>
 <div class="card"><h2>时间点评论</h2><input id="time" type="number" value="1200"><input id="comment" value="请复核这里的术语"><button onclick="addComment()">添加评论</button><pre id="commentResult"></pre></div>
 <div class="card"><h2>状态流转</h2><button onclick="action('submit')">提交复核</button><button onclick="review('approve')">复核通过</button><button onclick="review('reject')">退回修改</button><button onclick="action('lock')">锁定</button><button onclick="action('deliver')">交付</button><pre id="stateResult"></pre></div>
+<div class="card"><h2>复核结论</h2><div id="reviews">刷新后展示该版本的复核结论。</div></div>
 <script>
 const auth=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
 async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
-async function saveCue(){try{cueResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/cues',{method:'POST',headers:auth(),body:cue.value}),null,2)}catch(e){cueResult.textContent=e.message}}
+const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const fmt=c=>'#'+c.cue_index+' ['+c.start_ms+'–'+c.end_ms+'ms] '+c.text;
+async function createVersion(){try{const body={language:lang.value};if(parentId.value){body.parent_id=+parentId.value;body.rework_reason=reason.value}versionResult.textContent=JSON.stringify(await call('/api/projects/'+projId.value+'/versions',{method:'POST',headers:auth(),body:JSON.stringify(body)}),null,2);refresh()}catch(e){versionResult.textContent=e.message}}
+async function saveCue(){try{cueResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/cues',{method:'POST',headers:auth(),body:cue.value}),null,2);refresh()}catch(e){cueResult.textContent=e.message}}
+async function removeCue(){try{cueResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/cues/'+delCue.value,{method:'DELETE',headers:auth(),body:'{}'}),null,2);refresh()}catch(e){cueResult.textContent=e.message}}
 async function addComment(){try{commentResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/comments',{method:'POST',headers:auth(),body:JSON.stringify({time_ms:+time.value,body:comment.value})}),null,2)}catch(e){commentResult.textContent=e.message}}
 async function action(name){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/'+name,{method:'POST',headers:auth(),body:'{}'}),null,2);refresh()}catch(e){stateResult.textContent=e.message}}
 async function review(decision){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/review',{method:'POST',headers:auth(),body:JSON.stringify({decision,comment:''})}),null,2);refresh()}catch(e){stateResult.textContent=e.message}}
-async function refresh(){try{const [p,v,c,cm,d]=await Promise.all(['/api/projects','/api/versions','/api/versions/'+version.value+'/cues','/api/versions/'+version.value+'/comments','/api/deliveries'].map(call));data.textContent=JSON.stringify({p,v,c,cm,d},null,2)}catch(e){data.textContent=e.message}}
+function renderDiff(d){if(!d){diff.innerHTML='该版本没有父版本基线，无返修差异。';return}
+  let h='<p>父版本 #'+d.parent_id+' ｜ 返修原因：'+esc(d.rework_reason||'—')+' ｜ 状态：'+esc(d.status)+' ｜ 未变化 '+d.unchanged+' 句</p>';
+  h+='<h3>新增 '+d.added.length+' 句</h3><ul class="add">'+d.added.map(c=>'<li>'+esc(fmt(c))+'</li>').join('')+'</ul>';
+  h+='<h3>改写 '+d.modified.length+' 句</h3><ul class="mod">'+d.modified.map(m=>'<li>#'+m.cue_index+'（'+m.changes.join('、')+'）<br><small>原：'+esc(fmt(m.before))+'</small><br>新：'+esc(fmt(m.after))+'</li>').join('')+'</ul>';
+  h+='<h3>移除 '+d.removed.length+' 句</h3><ul class="del">'+d.removed.map(c=>'<li>'+esc(fmt(c))+'</li>').join('')+'</ul>';
+  diff.innerHTML=h}
+async function refresh(){try{const [p,v,c,cm,d]=await Promise.all(['/api/projects','/api/versions','/api/versions/'+version.value+'/cues','/api/versions/'+version.value+'/comments','/api/deliveries'].map(call));data.textContent=JSON.stringify({p,v,c,cm,d},null,2)}catch(e){data.textContent=e.message}
+  try{renderDiff(await call('/api/versions/'+version.value+'/diff'))}catch(e){renderDiff(null)}
+  try{const rv=await call('/api/versions/'+version.value+'/reviews');reviews.innerHTML=rv.reviews.length?'<ul>'+rv.reviews.map(r=>'<li class="mod">['+esc(r.created_at)+'] '+esc(r.reviewer)+'：'+esc(r.decision)+' '+esc(r.comment)+'</li>').join('')+'</ul>':'该版本暂无复核结论。'}catch(e){reviews.textContent=e.message}}
 </script></body></html>
