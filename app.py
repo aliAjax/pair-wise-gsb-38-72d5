@@ -10,7 +10,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from diff import diff_cues
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "subtitle_qc.db"
@@ -60,6 +62,7 @@ class Database:
                     parent_id INTEGER REFERENCES versions(id),
                     status TEXT NOT NULL DEFAULT 'draft',
                     revision INTEGER NOT NULL DEFAULT 0,
+                    revision_reason TEXT NOT NULL DEFAULT '',
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -133,6 +136,9 @@ class Database:
                 );
                 """
             )
+            columns = {r["name"] for r in conn.execute("PRAGMA table_info(versions)")}
+            if "revision_reason" not in columns:
+                conn.execute("ALTER TABLE versions ADD COLUMN revision_reason TEXT NOT NULL DEFAULT ''")
 
     def _audit(self, conn: sqlite3.Connection, actor: str, action: str, entity_type: str,
                entity_id: int | None, details: dict[str, Any]) -> None:
@@ -190,7 +196,16 @@ class Database:
         language = str(payload.get("language", "")).strip()
         if not language:
             raise DomainError("目标语言不能为空")
-        parent_id = payload.get("parent_id")
+        raw_parent = payload.get("parent_id")
+        parent_id: int | None = None
+        if raw_parent is not None and str(raw_parent).strip() != "":
+            try:
+                parent_id = int(raw_parent)
+            except (TypeError, ValueError) as exc:
+                raise DomainError("父版本编号不合法") from exc
+        revision_reason = str(payload.get("revision_reason", "")).strip()
+        if parent_id is not None and not revision_reason:
+            raise DomainError("返修版本必须填写返修原因", 409)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             project = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
@@ -199,16 +214,52 @@ class Database:
             if actor != project["owner"] and role != "admin":
                 raise DomainError("只有项目负责人可以创建版本", 403)
             if parent_id is not None:
-                parent = conn.execute("SELECT * FROM versions WHERE id=? AND project_id=?", (int(parent_id), project_id)).fetchone()
-                if not parent or parent["language"] != language:
-                    raise DomainError("父版本不存在或目标语言不一致", 409)
+                # Every failure gets its own message so a new revision is
+                # never silently based on a wrong baseline.
+                parent = conn.execute("SELECT * FROM versions WHERE id=?", (parent_id,)).fetchone()
+                if not parent:
+                    raise DomainError(f"父版本 {parent_id} 不存在，不能作为返修基线", 409)
+                if int(parent["project_id"]) != int(project_id):
+                    parent_project = conn.execute("SELECT name FROM projects WHERE id=?", (parent["project_id"],)).fetchone()
+                    project_name = parent_project["name"] if parent_project else f"#{parent['project_id']}"
+                    raise DomainError(
+                        f"父版本 {parent_id} 属于项目「{project_name}」，与当前项目不一致，不能作为返修基线",
+                        409,
+                    )
+                if parent["language"] != language:
+                    raise DomainError(
+                        f"父版本 {parent_id} 的语言是 {parent['language']}，与目标语言 {language} 不一致，不能作为返修基线",
+                        409,
+                    )
             next_no = int(conn.execute("SELECT COALESCE(MAX(version_no),0)+1 value FROM versions WHERE project_id=? AND language=?", (project_id, language)).fetchone()["value"])
             cur = conn.execute(
-                "INSERT INTO versions(project_id,language,version_no,parent_id,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                (project_id, language, next_no, parent_id, actor, utcnow(), utcnow()),
+                "INSERT INTO versions(project_id,language,version_no,parent_id,revision_reason,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (project_id, language, next_no, parent_id, revision_reason if parent_id is not None else "", actor, utcnow(), utcnow()),
             )
-            self._audit(conn, actor, "version.created", "version", cur.lastrowid, {"language": language, "version_no": next_no})
-            return dict(conn.execute("SELECT * FROM versions WHERE id=?", (cur.lastrowid,)).fetchone())
+            version_id = int(cur.lastrowid)
+            copied = 0
+            if parent_id is not None:
+                # Carry the approved subtitle content forward so the revision
+                # starts from its parent instead of an empty draft. Reviews
+                # and comments stay attached to the old version for history.
+                parent_cues = conn.execute(
+                    "SELECT cue_index,start_ms,end_ms,text FROM cues WHERE version_id=? ORDER BY cue_index",
+                    (parent_id,),
+                ).fetchall()
+                now = utcnow()
+                conn.executemany(
+                    "INSERT INTO cues(version_id,cue_index,start_ms,end_ms,text,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)",
+                    [(version_id, r["cue_index"], r["start_ms"], r["end_ms"], r["text"], actor, now) for r in parent_cues],
+                )
+                copied = len(parent_cues)
+            self._audit(conn, actor, "version.created", "version", version_id, {
+                "language": language,
+                "version_no": next_no,
+                "parent_id": parent_id,
+                "revision_reason": revision_reason if parent_id is not None else "",
+                "copied_cues": copied,
+            })
+            return dict(conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone())
 
     def assign(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
         user = str(payload.get("user", "")).strip()
@@ -395,6 +446,64 @@ class Database:
                 rows = conn.execute("SELECT * FROM versions ORDER BY id").fetchall()
             return [dict(r) for r in rows]
 
+    def get_version(self, version_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone()
+            if not row:
+                raise DomainError("字幕版本不存在", 404)
+            version = dict(row)
+            latest_review = conn.execute(
+                "SELECT reviewer,decision,comment,created_at FROM reviews WHERE version_id=? ORDER BY id DESC LIMIT 1",
+                (version_id,),
+            ).fetchone()
+            version["latest_review"] = dict(latest_review) if latest_review else None
+            if version["parent_id"] is not None:
+                parent = conn.execute("SELECT id,version_no,language,status FROM versions WHERE id=?", (version["parent_id"],)).fetchone()
+                version["parent"] = dict(parent) if parent else None
+            else:
+                version["parent"] = None
+            return version
+
+    def list_reviews(self, version_id: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if not conn.execute("SELECT 1 FROM versions WHERE id=?", (version_id,)).fetchone():
+                raise DomainError("字幕版本不存在", 404)
+            return [dict(r) for r in conn.execute(
+                "SELECT id,reviewer,decision,comment,created_at FROM reviews WHERE version_id=? ORDER BY id",
+                (version_id,),
+            ).fetchall()]
+
+    def version_diff(self, version_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone()
+            if not row:
+                raise DomainError("字幕版本不存在", 404)
+            result: dict[str, Any] = {
+                "version_id": version_id,
+                "parent_id": row["parent_id"],
+                "revision_reason": row["revision_reason"],
+                "status": row["status"],
+            }
+            if row["parent_id"] is None:
+                result.update({"is_revision": False, "retained": False, "diff": None})
+                return result
+            parent_cues = [dict(r) for r in conn.execute(
+                "SELECT cue_index,start_ms,end_ms,text FROM cues WHERE version_id=? ORDER BY cue_index",
+                (row["parent_id"],),
+            ).fetchall()]
+            child_cues = [dict(r) for r in conn.execute(
+                "SELECT cue_index,start_ms,end_ms,text FROM cues WHERE version_id=? ORDER BY cue_index",
+                (version_id,),
+            ).fetchall()]
+            # The diff stays open ("retained") until the revision passes
+            # review; an approved version's diff becomes historical.
+            result.update({
+                "is_revision": True,
+                "retained": row["status"] != "approved",
+                "diff": diff_cues(parent_cues, child_cues),
+            })
+            return result
+
     def list_cues(self, version_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute("SELECT * FROM cues WHERE version_id=? ORDER BY cue_index", (version_id,)).fetchall()]
@@ -434,9 +543,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _html(self) -> None:
-        data = (ROOT / "static" / "index.html").read_bytes()
+        self._static("index.html", "text/html; charset=utf-8")
+
+    def _static(self, name: str, content_type: str) -> None:
+        # Only files directly inside static/ are served; no path traversal.
+        path = (ROOT / "static" / Path(name).name).resolve()
+        if ROOT.joinpath("static") not in path.parents or not path.is_file():
+            raise DomainError("资源不存在", 404)
+        data = path.read_bytes()
         self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -458,17 +574,28 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path in {"/", "/index.html"}:
                 return self._html()
+            if parsed.path == "/static/styles.css":
+                return self._static("styles.css", "text/css; charset=utf-8")
+            if parsed.path == "/static/app.js":
+                return self._static("app.js", "application/javascript; charset=utf-8")
             if parsed.path == "/api/health":
                 return self._send({"ok": True})
             if parsed.path == "/api/projects":
                 return self._send({"projects": self.db.list_projects()})
             if parsed.path == "/api/versions":
-                return self._send({"versions": self.db.list_versions()})
+                project_filter = parse_qs(parsed.query).get("project_id", [None])[0]
+                return self._send({"versions": self.db.list_versions(int(project_filter) if project_filter else None)})
             if parsed.path == "/api/deliveries":
                 return self._send({"deliveries": self.db.list_deliveries()})
             if parsed.path == "/api/audit":
                 return self._send({"audit": self.db.audit()})
             parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 3 and parts[:2] == ["api", "versions"]:
+                return self._send(self.db.get_version(int(parts[2])))
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "diff":
+                return self._send(self.db.version_diff(int(parts[2])))
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "reviews":
+                return self._send({"reviews": self.db.list_reviews(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "cues":
                 return self._send({"cues": self.db.list_cues(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":

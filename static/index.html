@@ -1,17 +1,79 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>字幕本地化质检</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px}input,select,textarea,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre,textarea{background:#f5f7f9;padding:12px;overflow:auto;width:100%;box-sizing:border-box}button{cursor:pointer}small{color:#667}</style></head>
-<body><h1>影视字幕本地化质检</h1><p>示例项目已含术语表。分配翻译、时间轴和复核人员后，录入带时间点的字幕与评论，再完成提交、复核、锁定和交付。</p>
-<div class="card"><h2>身份与版本</h2><input id="user" value="alice"><select id="role"><option>owner</option><option>reviewer</option><option>translator</option><option>admin</option></select><label>版本 ID <input id="version" type="number" value="1"></label><button onclick="refresh()">刷新</button><pre id="data">等待刷新…</pre></div>
-<div class="card"><h2>录入字幕</h2><textarea id="cue" rows="5">{"cue_index":1,"start_ms":1000,"end_ms":3000,"text":"海豹出现在冰面上","expected_revision":0}</textarea><button onclick="saveCue()">保存字幕</button><pre id="cueResult"></pre></div>
-<div class="card"><h2>时间点评论</h2><input id="time" type="number" value="1200"><input id="comment" value="请复核这里的术语"><button onclick="addComment()">添加评论</button><pre id="commentResult"></pre></div>
-<div class="card"><h2>状态流转</h2><button onclick="action('submit')">提交复核</button><button onclick="review('approve')">复核通过</button><button onclick="review('reject')">退回修改</button><button onclick="action('lock')">锁定</button><button onclick="action('deliver')">交付</button><pre id="stateResult"></pre></div>
-<script>
-const auth=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
-async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
-async function saveCue(){try{cueResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/cues',{method:'POST',headers:auth(),body:cue.value}),null,2)}catch(e){cueResult.textContent=e.message}}
-async function addComment(){try{commentResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/comments',{method:'POST',headers:auth(),body:JSON.stringify({time_ms:+time.value,body:comment.value})}),null,2)}catch(e){commentResult.textContent=e.message}}
-async function action(name){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/'+name,{method:'POST',headers:auth(),body:'{}'}),null,2);refresh()}catch(e){stateResult.textContent=e.message}}
-async function review(decision){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/review',{method:'POST',headers:auth(),body:JSON.stringify({decision,comment:''})}),null,2);refresh()}catch(e){stateResult.textContent=e.message}}
-async function refresh(){try{const [p,v,c,cm,d]=await Promise.all(['/api/projects','/api/versions','/api/versions/'+version.value+'/cues','/api/versions/'+version.value+'/comments','/api/deliveries'].map(call));data.textContent=JSON.stringify({p,v,c,cm,d},null,2)}catch(e){data.textContent=e.message}}
-</script></body></html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>影视字幕本地化质检</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<h1>影视字幕本地化质检</h1>
+<p>负责人可基于同项目同语言的父版本发起返修：新版本继承父版字幕并登记返修原因，打开即显示相对父版本的句子差异；复核通过前差异持续保留，旧版本、原复核结论与交付快照完整可查。</p>
+
+<section class="card">
+  <h2>身份</h2>
+  <label>用户 <input id="user" value="alice"></label>
+  <label>角色
+    <select id="role">
+      <option>owner</option><option>admin</option><option>reviewer</option>
+      <option>translator</option><option>timeline</option>
+    </select>
+  </label>
+  <button onclick="refreshAll()">刷新全部</button>
+</section>
+
+<section class="card">
+  <h2>项目与版本</h2>
+  <label>项目
+    <select id="projectSelect" onchange="onProjectChange()"></select>
+  </label>
+  <div id="versionList"></div>
+  <h3>新建版本</h3>
+  <form class="grid" onsubmit="return createVersion(event)">
+    <label>目标语言 <input id="newLanguage" value="zh-CN" required></label>
+    <label>父版本（返修时选择）
+      <select id="newParent" onchange="onParentChange()"></select>
+    </label>
+    <label class="wide" id="reasonWrap" hidden>返修原因
+      <textarea id="newReason" rows="2" placeholder="例如：复核退回，第 3 句术语需改为指定译法"></textarea>
+    </label>
+    <div class="wide"><button type="submit">创建版本</button></div>
+  </form>
+  <pre id="createResult" class="result"></pre>
+</section>
+
+<section class="card" id="versionPanel" hidden>
+  <h2>版本 <span id="versionTitle"></span></h2>
+  <div id="versionMeta"></div>
+  <div id="diffPanel"></div>
+  <h3>字幕条目</h3>
+  <div id="cueList"></div>
+  <h3>保存字幕（需要 expected_revision）</h3>
+  <textarea id="cueInput" rows="4">{"cue_index":1,"start_ms":1000,"end_ms":3000,"text":"海豹出现在冰面上","expected_revision":0}</textarea>
+  <button onclick="saveCue()">保存字幕</button>
+  <pre id="cueResult" class="result"></pre>
+  <h3>时间点评论</h3>
+  <label>时间(ms) <input id="commentTime" type="number" value="1200"></label>
+  <label>内容 <input id="commentBody" value="请复核这里的术语"></label>
+  <button onclick="addComment()">添加评论</button>
+  <div id="commentList"></div>
+  <h3>复核流转</h3>
+  <button onclick="action('submit')">提交复核</button>
+  <button onclick="review('approve')">复核通过</button>
+  <button onclick="review('reject')">退回修改</button>
+  <button onclick="action('lock')">锁定</button>
+  <button onclick="action('deliver')">交付</button>
+  <pre id="stateResult" class="result"></pre>
+  <h3>本版本复核结论</h3>
+  <div id="reviewList"></div>
+</section>
+
+<section class="card">
+  <h2>交付快照</h2>
+  <p>同语言的新交付只会把旧版本标记为 superseded，旧快照永不删除。</p>
+  <div id="deliveryList"></div>
+</section>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
